@@ -31,7 +31,17 @@ export const addApiKeyToHeader: BeforeRequestMiddleware = (
   const url = normalizeUrl(request.url ?? "");
   const serverUrl = normalizeUrl(bundle.authData.serverUrl as string);
   const isBridge = url.startsWith(WEBHOOK_BRIDGE_URL);
-  const isServerRequest = url.startsWith(serverUrl);
+  // Use proper origin comparison to prevent prefix-match attacks.
+  // e.g., attacker.tld/https://server.photon.codes should NOT match.
+  let isServerRequest = false;
+  try {
+    const urlOrigin = new URL(url).origin;
+    const serverOrigin = new URL(serverUrl).origin;
+    isServerRequest = urlOrigin === serverOrigin;
+  } catch {
+    // Malformed URL: treat as not matching for safety
+    isServerRequest = false;
+  }
 
   if (isServerRequest || isBridge) {
     request.url = url;

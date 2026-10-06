@@ -7,6 +7,44 @@ import { randomUUID } from "node:crypto";
 import FormData from "form-data";
 import { requireInboundMessage, normalizeChatGuid } from "./inboundCheck.js";
 
+// Helper to detect private/internal IP addresses and hostnames (SSRF protection)
+function isPrivateOrInternalHost(hostname: string): boolean {
+  // Block localhost
+  if (hostname === "localhost" || hostname === "localhost.localdomain") {
+    return true;
+  }
+  // Block IPv4 loopback
+  if (hostname === "127.0.0.1" || hostname.startsWith("127.")) {
+    return true;
+  }
+  // Block IPv6 loopback
+  if (hostname === "::1" || hostname === "::ffff:127.0.0.1") {
+    return true;
+  }
+  // Block link-local (IPv4 and IPv6)
+  if (hostname === "169.254.169.254" || hostname.startsWith("169.254.")) {
+    return true;
+  }
+  if (hostname.startsWith("fe80:")) {
+    return true;
+  }
+  // Block private IPv4 ranges: 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
+  const ipv4Match = hostname.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
+  if (ipv4Match) {
+    const o1 = Number(ipv4Match[1] ?? 0);
+    const o2 = Number(ipv4Match[2] ?? 0);
+    if (o1 === 10) return true;
+    if (o1 === 172 && o2 >= 16 && o2 <= 31) return true;
+    if (o1 === 192 && o2 === 168) return true;
+    if (o1 === 0) return true; // 0.0.0.0/8
+  }
+  // Block private IPv6 ranges (fc00::/7 - ULA)
+  if (hostname.startsWith("fc") || hostname.startsWith("fd")) {
+    return true;
+  }
+  return false;
+}
+
 const inputFields = defineInputFields([
   {
     key: "chatGuid",
@@ -44,12 +82,41 @@ const perform = (async (z, bundle) => {
   const chatGuid = normalizeChatGuid(bundle.inputData.chatGuid as string);
   await requireInboundMessage(z, bundle, chatGuid);
   const fileUrl = bundle.inputData.fileUrl as string;
+
+  // SSRF protection: validate URL scheme and host
+  let parsedUrl: URL;
+  try {
+    parsedUrl = new URL(fileUrl);
+  } catch {
+    throw new z.errors.Error(
+      "Invalid File URL. Must be a valid HTTP/HTTPS URL.",
+      "InvalidData",
+    );
+  }
+  if (parsedUrl.protocol !== "http:" && parsedUrl.protocol !== "https:") {
+    throw new z.errors.Error(
+      "File URL must use HTTP or HTTPS.",
+      "InvalidData",
+    );
+  }
+  // Block private/internal addresses
+  const hostname = parsedUrl.hostname;
+  const isPrivate = isPrivateOrInternalHost(hostname);
+  if (isPrivate) {
+    throw new z.errors.Error(
+      "File URL host is not allowed (private/internal address).",
+      "InvalidData",
+    );
+  }
+
   let fileResponse: { content?: string; buffer?: () => Promise<Buffer>; status?: number };
   try {
+    // Add timeout (30 seconds) to prevent resource exhaustion
     fileResponse = await z.request({
       url: fileUrl,
       raw: true,
       redirect: "follow",
+      timeout: 30000, // 30 seconds
     }) as unknown as { content?: string; buffer?: () => Promise<Buffer>; status?: number };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
